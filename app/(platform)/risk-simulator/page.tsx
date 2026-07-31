@@ -30,13 +30,19 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import {
   runMonteCarloSimulation,
+  buildOriginalOrderEquityPath,
+  defaultMeanBlockLength,
+  effectiveResamplePoolSize,
+  worstCaseInjectionCount,
   PortfolioStatsCalculator,
   getBlock,
   getDailyLogsByBlock,
   getTradesByBlockWithOptions,
-  getDefaultSimulationPeriod,
+  convertPeriodUnit,
+  getDefaultSimulationPeriodFromHistory,
   percentageToTrades,
   timeToTrades,
+  tradesToTime,
   downloadCsv,
   downloadJson,
   generateExportFilename,
@@ -46,11 +52,18 @@ import {
 import type {
   MonteCarloParams,
   MonteCarloResult,
+  OriginalOrderPath,
   DailyLogEntry,
   Trade,
   TimeUnit,
 } from "@tradeblocks/lib";
 import { useBlockStore } from "@tradeblocks/lib/stores";
+import {
+  describeBlockLength,
+  describeBlockLengthSetting,
+  selectBlockLengthHint,
+} from "./block-length-hint";
+import { describeSimulationHorizon } from "./horizon-notice";
 import { Download, HelpCircle, Loader2, Play, RotateCcw } from "lucide-react";
 import { useTheme } from "next-themes";
 import dynamic from "next/dynamic";
@@ -66,7 +79,9 @@ export default function RiskSimulatorPage() {
   // Simulation parameters
   const [numSimulations, setNumSimulations] = useState(1000);
   const [simulationPeriodValue, setSimulationPeriodValue] = useState(1);
-  const [simulationPeriodUnit, setSimulationPeriodUnit] = useState<TimeUnit>("years");
+  const [simulationPeriodUnit, setSimulationPeriodUnit] = useState<TimeUnit>("trades");
+  // Once the horizon is edited by hand, stop re-deriving it from the history
+  const [simulationPeriodEdited, setSimulationPeriodEdited] = useState(false);
   const [resamplePercentage, setResamplePercentage] = useState(100);
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
   const [initialCapital, setInitialCapital] = useState(100000);
@@ -74,6 +89,9 @@ export default function RiskSimulatorPage() {
   const [resampleMethod, setResampleMethod] = useState<"trades" | "daily" | "percentage">(
     "percentage",
   );
+  const [resampleMode, setResampleMode] = useState<"iid" | "stationary-block">("stationary-block");
+  const [meanBlockLength, setMeanBlockLength] = useState<number | null>(null); // null = auto
+  const [ruinThresholdPercent, setRuinThresholdPercent] = useState<number | null>(null); // null = off
   const [useFixedSeed, setUseFixedSeed] = useState(true);
   const [seedValue, setSeedValue] = useState(42);
   const [normalizeTo1Lot, setNormalizeTo1Lot] = useState(false);
@@ -94,6 +112,7 @@ export default function RiskSimulatorPage() {
   // Simulation state
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<MonteCarloResult | null>(null);
+  const [originalOrder, setOriginalOrder] = useState<OriginalOrderPath | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Get available strategies from active block
@@ -112,7 +131,8 @@ export default function RiskSimulatorPage() {
     }));
   };
 
-  const tradesForWorstCase = useMemo(() => {
+  // Trades the simulation will actually sample from, after the strategy filter
+  const filteredTrades = useMemo(() => {
     if (selectedStrategies.length > 0) {
       const selected = new Set(selectedStrategies);
       return trades.filter((trade) => selected.has(trade.strategy || ""));
@@ -198,13 +218,30 @@ export default function RiskSimulatorPage() {
     const fallbackTradesPerYear = calculatedTradesPerYear > 0 ? calculatedTradesPerYear : 252;
     setTradesPerYear(fallbackTradesPerYear);
     setInitialCapital(calculatedInitialCapital);
-    // Set default simulation period based on trading frequency
-    const defaults = getDefaultSimulationPeriod(fallbackTradesPerYear);
-    setSimulationPeriodValue(defaults.value);
-    setSimulationPeriodUnit(defaults.unit);
     // Default to using the full history unless the user opts in to recency weighting
     setResamplePercentage(100);
   }, [calculatedTradesPerYear, calculatedInitialCapital, trades.length]);
+
+  // The horizon defaults to the history in scope (after the strategy filter), in
+  // exact trades, so a run projects as far as the data the user just looked at.
+  const defaultSimulationPeriod = useMemo(
+    () => getDefaultSimulationPeriodFromHistory(filteredTrades.length),
+    [filteredTrades.length],
+  );
+
+  const matchSimulationPeriodToHistory = () => {
+    setSimulationPeriodValue(defaultSimulationPeriod.value);
+    setSimulationPeriodUnit(defaultSimulationPeriod.unit);
+    setSimulationPeriodEdited(false);
+  };
+
+  // Follow the history whenever it changes (new block, different strategies),
+  // but never overwrite a horizon the user typed themselves.
+  useEffect(() => {
+    if (simulationPeriodEdited) return;
+    setSimulationPeriodValue(defaultSimulationPeriod.value);
+    setSimulationPeriodUnit(defaultSimulationPeriod.unit);
+  }, [defaultSimulationPeriod, simulationPeriodEdited]);
 
   // Calculate actual values from user-friendly inputs
   const simulationLength = useMemo(() => {
@@ -212,19 +249,18 @@ export default function RiskSimulatorPage() {
   }, [simulationPeriodValue, simulationPeriodUnit, tradesPerYear]);
 
   const worstCaseSimulationBudget = useMemo(() => {
-    if (!worstCaseEnabled || simulationLength <= 0) {
+    if (!worstCaseEnabled) {
       return 0;
     }
-    const requested = Math.ceil((simulationLength * worstCasePercentage) / 100);
-    return Math.min(simulationLength, Math.max(1, requested));
+    return worstCaseInjectionCount(simulationLength, worstCasePercentage);
   }, [worstCaseEnabled, simulationLength, worstCasePercentage]);
 
   const historicalWorstCaseRequest = useMemo(() => {
-    if (!worstCaseEnabled || worstCaseBasedOn !== "historical" || tradesForWorstCase.length === 0) {
+    if (!worstCaseEnabled || worstCaseBasedOn !== "historical" || filteredTrades.length === 0) {
       return 0;
     }
 
-    const counts = tradesForWorstCase.reduce((acc, trade) => {
+    const counts = filteredTrades.reduce((acc, trade) => {
       const strategy = trade.strategy || "Unknown";
       acc.set(strategy, (acc.get(strategy) ?? 0) + 1);
       return acc;
@@ -235,7 +271,65 @@ export default function RiskSimulatorPage() {
       totalRequested += Math.max(1, Math.round((count * worstCasePercentage) / 100));
     }
     return totalRequested;
-  }, [tradesForWorstCase, worstCaseBasedOn, worstCaseEnabled, worstCasePercentage]);
+  }, [filteredTrades, worstCaseBasedOn, worstCaseEnabled, worstCasePercentage]);
+
+  // Approximate size of the resample pool with the current settings, used to
+  // preview the automatic mean block length for stationary-block resampling.
+  const estimatedPoolSize = useMemo(() => {
+    if (filteredTrades.length === 0) return 0;
+
+    let count: number;
+    if (resampleMethod === "daily") {
+      count = new Set(filteredTrades.map((t) => t.dateOpened.toISOString().split("T")[0])).size;
+    } else {
+      count = filteredTrades.length;
+    }
+
+    if (resamplePercentage < 100) {
+      const window = percentageToTrades(resamplePercentage, filteredTrades.length);
+      if (window < count) count = window;
+    }
+    return count;
+  }, [filteredTrades, resampleMethod, resamplePercentage]);
+
+  // The block-length hint has to describe the pool the run will actually draw
+  // from: in "pool" mode the synthetic worst-case trades join the pool, so
+  // leaving them out understates the automatic block length.
+  const effectivePoolSize = effectiveResamplePoolSize(estimatedPoolSize, {
+    enabled: worstCaseEnabled,
+    mode: worstCaseMode,
+    injectedCount: worstCaseSimulationBudget,
+  });
+
+  const autoBlockLength = defaultMeanBlockLength(Math.max(1, effectivePoolSize));
+  const blockStepUnit = resampleMethod === "daily" ? "days" : "trades";
+
+  // Prefer the block length a completed run reported over the pre-run estimate,
+  // so the hint stops guessing once the real number exists.
+  const blockLengthHint = selectBlockLengthHint({
+    lastRunBlockLength: result?.effectiveMeanBlockLength ?? null,
+    lastRunRequestedBlockLength: result?.parameters.meanBlockLength ?? null,
+    lastRunStepUnit: result
+      ? result.parameters.resampleMethod === "daily"
+        ? "days"
+        : "trades"
+      : null,
+    requestedBlockLength: meanBlockLength,
+    estimatedBlockLength: autoBlockLength,
+    stepUnit: blockStepUnit,
+  });
+  const blockLengthText = describeBlockLength(blockLengthHint);
+
+  // A hand-typed horizon is deliberately kept across a strategy switch, so it
+  // can end up describing a different history than the one now in scope. Say so
+  // rather than letting the mismatch sit there silently.
+  const simulationHorizon = describeSimulationHorizon({
+    horizonEdited: simulationPeriodEdited,
+    simulationLength,
+    historyTradeCount: filteredTrades.length,
+    unit: simulationPeriodUnit,
+    paceText: tradesToTime(simulationLength, tradesPerYear).displayText,
+  });
 
   const shouldShowHistoricalCapHint =
     worstCaseEnabled &&
@@ -256,12 +350,6 @@ export default function RiskSimulatorPage() {
     try {
       // Give React a chance to render the loading state before crunching numbers
       await new Promise((resolve) => setTimeout(resolve, 16));
-      // Filter trades by selected strategies if any are selected
-      const filteredTrades =
-        selectedStrategies.length > 0
-          ? trades.filter((t) => selectedStrategies.includes(t.strategy || ""))
-          : trades;
-
       const isStrategyFiltered = filteredTrades.length !== trades.length;
 
       if (filteredTrades.length === 0) {
@@ -306,6 +394,8 @@ export default function RiskSimulatorPage() {
         simulationLength: effectiveSimulationLength,
         resampleWindow,
         resampleMethod,
+        resampleMode,
+        meanBlockLength: meanBlockLength ?? undefined, // undefined = auto (cube root of pool size)
         initialCapital,
         historicalInitialCapital, // Only set when simulating a subset of strategies
         strategy: undefined, // We pre-filter trades instead
@@ -317,10 +407,24 @@ export default function RiskSimulatorPage() {
         worstCaseMode,
         worstCaseBasedOn,
         worstCaseSizing,
+        ruinThresholdPct:
+          ruinThresholdPercent !== null && ruinThresholdPercent > 0
+            ? ruinThresholdPercent / 100
+            : undefined,
       };
 
       const simulationResult = runMonteCarloSimulation(filteredTrades, params);
       setResult(simulationResult);
+      // Reconstruct what actually happened, in original order, from the same
+      // filtered history and settings the simulation sampled from.
+      setOriginalOrder(
+        buildOriginalOrderEquityPath(filteredTrades, {
+          resampleMethod,
+          initialCapital,
+          historicalInitialCapital,
+          normalizeTo1Lot,
+        }),
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Simulation failed");
     } finally {
@@ -330,6 +434,7 @@ export default function RiskSimulatorPage() {
 
   const resetSimulation = () => {
     setResult(null);
+    setOriginalOrder(null);
     setError(null);
   };
 
@@ -346,8 +451,13 @@ export default function RiskSimulatorPage() {
       parameters: {
         numSimulations: result.parameters.numSimulations,
         simulationLength: result.parameters.simulationLength,
+        // The horizon is a step count; a step is a day in daily-resample mode
+        simulationLengthUnit: result.parameters.resampleMethod === "daily" ? "days" : "trades",
         resampleWindow: result.parameters.resampleWindow,
         resampleMethod: result.parameters.resampleMethod,
+        resampleMode: result.parameters.resampleMode,
+        meanBlockLength: result.parameters.meanBlockLength ?? null, // null = auto
+        effectiveMeanBlockLength: result.effectiveMeanBlockLength,
         initialCapital: result.parameters.initialCapital,
         tradesPerYear: result.parameters.tradesPerYear,
         randomSeed: result.parameters.randomSeed,
@@ -357,6 +467,7 @@ export default function RiskSimulatorPage() {
         worstCaseMode: result.parameters.worstCaseMode,
         worstCaseBasedOn: result.parameters.worstCaseBasedOn,
         worstCaseSizing: result.parameters.worstCaseSizing,
+        ruinThresholdPct: result.parameters.ruinThresholdPct ?? null, // null = off
       },
       percentiles: {
         steps: result.percentiles.steps,
@@ -379,6 +490,8 @@ export default function RiskSimulatorPage() {
         meanSharpeRatio: result.statistics.meanSharpeRatio,
         probabilityOfProfit: result.statistics.probabilityOfProfit,
         valueAtRisk: result.statistics.valueAtRisk,
+        zeroBalancePaths: result.statistics.zeroBalancePaths,
+        probabilityOfRuin: result.statistics.probabilityOfRuin ?? null,
       },
       actualResamplePoolSize: result.actualResamplePoolSize,
       selectedStrategies: selectedStrategies.length > 0 ? selectedStrategies : "all",
@@ -397,8 +510,35 @@ export default function RiskSimulatorPage() {
     lines.push(toCsvRow(["Block", activeBlock.name]));
     lines.push(toCsvRow(["Exported At", new Date().toISOString()]));
     lines.push(toCsvRow(["Number of Simulations", result.parameters.numSimulations]));
-    lines.push(toCsvRow(["Simulation Length (trades)", result.parameters.simulationLength]));
+    lines.push(
+      toCsvRow([
+        result.parameters.resampleMethod === "daily"
+          ? "Simulation Length (days)"
+          : "Simulation Length (trades)",
+        result.parameters.simulationLength,
+      ]),
+    );
     lines.push(toCsvRow(["Resample Method", result.parameters.resampleMethod]));
+    lines.push(
+      toCsvRow([
+        "Resampling",
+        result.parameters.resampleMode === "iid" ? "iid (independent draws)" : "stationary-block",
+      ]),
+    );
+    lines.push(
+      toCsvRow([
+        "Mean Block Length",
+        result.parameters.meanBlockLength ?? `auto (${result.effectiveMeanBlockLength})`,
+      ]),
+    );
+    lines.push(
+      toCsvRow([
+        "Ruin Threshold",
+        result.parameters.ruinThresholdPct !== undefined
+          ? `${(result.parameters.ruinThresholdPct * 100).toFixed(0)}%`
+          : "off",
+      ]),
+    );
     lines.push(toCsvRow(["Initial Capital", `$${result.parameters.initialCapital}`]));
     lines.push(toCsvRow(["Trades Per Year", result.parameters.tradesPerYear]));
     lines.push(toCsvRow(["Random Seed", result.parameters.randomSeed ?? "none"]));
@@ -476,6 +616,17 @@ export default function RiskSimulatorPage() {
         `${(result.statistics.valueAtRisk.p25 * 100).toFixed(2)}%`,
       ]),
     );
+    lines.push(
+      toCsvRow(["Zero-Balance Paths", `${(result.statistics.zeroBalancePaths * 100).toFixed(2)}%`]),
+    );
+    if (result.statistics.probabilityOfRuin !== undefined) {
+      lines.push(
+        toCsvRow([
+          "Probability of Ruin",
+          `${(result.statistics.probabilityOfRuin * 100).toFixed(2)}%`,
+        ]),
+      );
+    }
     lines.push("");
 
     // Percentile trajectories (cumulative returns as decimals, e.g., 0.50 = 50% return)
@@ -549,10 +700,12 @@ export default function RiskSimulatorPage() {
                       actual trade results.
                     </p>
                     <p className="text-xs text-muted-foreground leading-relaxed">
-                      Each simulation randomly samples from your historical performance to project
-                      potential outcomes. This helps understand risk ranges and probability
-                      distributions, but doesn&apos;t predict actual future results. Use these
-                      projections to stress-test your strategy and understand downside scenarios.
+                      Each simulation resamples your historical performance — either keeping short
+                      streaks of neighboring trades together or drawing every trade independently,
+                      depending on the Resampling setting — to project potential outcomes. This
+                      helps understand risk ranges and probability distributions, but doesn&apos;t
+                      predict actual future results. Use these projections to stress-test your
+                      strategy and understand downside scenarios.
                     </p>
                   </div>
                 </div>
@@ -622,9 +775,10 @@ export default function RiskSimulatorPage() {
                           How far into the future to project your portfolio performance.
                         </p>
                         <p className="text-xs text-muted-foreground leading-relaxed">
-                          Choose a timeframe in familiar units (days, months, or years). The
-                          simulator converts this to the number of trades based on your historical
-                          trading frequency. Longer periods show a wider range of possible outcomes
+                          Starts at the length of the history you loaded, counted in trades, so a
+                          run projects exactly as far as the data behind it. Switch to days, months,
+                          or years to pick a timeframe instead, and the simulator converts it using
+                          your trading pace. Longer periods show a wider range of possible outcomes
                           as uncertainty compounds over time.
                         </p>
                       </div>
@@ -637,29 +791,54 @@ export default function RiskSimulatorPage() {
                   id="sim-period"
                   type="number"
                   value={simulationPeriodValue}
-                  onChange={(e) => setSimulationPeriodValue(parseFloat(e.target.value) || 1)}
-                  min={0.1}
-                  max={10}
-                  step={0.1}
+                  onChange={(e) => {
+                    setSimulationPeriodEdited(true);
+                    setSimulationPeriodValue(parseFloat(e.target.value) || 1);
+                  }}
+                  min={simulationPeriodUnit === "trades" ? 1 : 0.1}
+                  max={simulationPeriodUnit === "trades" ? 100000 : 10}
+                  step={simulationPeriodUnit === "trades" ? 1 : 0.1}
                   className="flex-1"
                 />
                 <Select
                   value={simulationPeriodUnit}
-                  onValueChange={(v) => setSimulationPeriodUnit(v as TimeUnit)}
+                  onValueChange={(v) => {
+                    // Changing the unit re-expresses the same horizon, it does not
+                    // request a different one, so carry the value across and leave
+                    // the edited flag alone — only typing a number pins the horizon.
+                    const nextUnit = v as TimeUnit;
+                    setSimulationPeriodValue((current) =>
+                      convertPeriodUnit(current, simulationPeriodUnit, nextUnit, tradesPerYear),
+                    );
+                    setSimulationPeriodUnit(nextUnit);
+                  }}
                 >
                   <SelectTrigger className="w-28">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="trades">Trades</SelectItem>
                     <SelectItem value="days">Days</SelectItem>
                     <SelectItem value="months">Months</SelectItem>
                     <SelectItem value="years">Years</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
-              <p className="text-xs text-muted-foreground">
-                ≈ {simulationLength.toLocaleString()} trades at your pace
-              </p>
+              {simulationHorizon.followsHistory ? (
+                <p className="text-xs text-muted-foreground">{simulationHorizon.text}</p>
+              ) : (
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-muted-foreground">{simulationHorizon.text}</p>
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="h-auto p-0 text-xs"
+                    onClick={matchSimulationPeriodToHistory}
+                  >
+                    Match my history
+                  </Button>
+                </div>
+              )}
             </div>
 
             {/* Column 3 - Trades Per Year */}
@@ -706,7 +885,8 @@ export default function RiskSimulatorPage() {
                 step={5}
               />
               <p className="text-xs text-muted-foreground">
-                Auto-detected pace ≈ {calculatedTradesPerYear.toLocaleString()} trades/year.
+                Auto-detected pace ≈ {calculatedTradesPerYear.toLocaleString()} trades/year, used to
+                annualize returns.
               </p>
             </div>
 
@@ -814,10 +994,16 @@ export default function RiskSimulatorPage() {
                       <strong>Daily Returns</strong> only if you always trade fixed dollar amounts.
                       Enable normalization to compare across different lot sizes.
                     </p>
+                    <p>
+                      <strong>Resampling:</strong> Stationary blocks keep short streaks of
+                      neighboring trades together so historic loss clustering carries into the
+                      simulation; independent trades shuffle everything randomly. Blocks mainly
+                      widen the simulated drawdowns and tails — the typical outcome barely moves.
+                    </p>
                     <p className="pt-2 border-t border-blue-200 dark:border-blue-800">
-                      <strong>💡 Tip:</strong> If you&apos;re unsure, stick with Percentage Returns.
-                      It prevents unrealistic drawdown calculations and matches how most traders
-                      actually size positions.
+                      <strong>💡 Tip:</strong> If you&apos;re unsure, stick with Percentage Returns
+                      and stationary blocks. Together they match how most traders actually size
+                      positions and how wins and losses actually arrive in streaks.
                     </p>
                   </div>
                 </div>
@@ -859,7 +1045,9 @@ export default function RiskSimulatorPage() {
                               Percentage Returns (Compounding):
                             </strong>{" "}
                             Converts each trade to a percentage return based on capital at trade
-                            time, then applies those percentages during simulation.{" "}
+                            time, then compounds those percentages trade by trade — each return is
+                            applied to the account&apos;s current value, the way a compounding
+                            account actually grows.{" "}
                             <strong className="text-primary">
                               Essential for compounding strategies
                             </strong>{" "}
@@ -889,6 +1077,62 @@ export default function RiskSimulatorPage() {
               </Select>
               <p className="text-xs text-muted-foreground">
                 How to resample from your trade history
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label>Resampling</Label>
+                <HoverCard>
+                  <HoverCardTrigger asChild>
+                    <HelpCircle className="h-3.5 w-3.5 text-muted-foreground/60 cursor-help" />
+                  </HoverCardTrigger>
+                  <HoverCardContent className="w-80 p-0 overflow-hidden">
+                    <div className="space-y-3">
+                      <div className="bg-primary/5 border-b px-4 py-3">
+                        <h4 className="text-sm font-semibold text-primary">Resampling</h4>
+                      </div>
+                      <div className="px-4 pb-4 space-y-3">
+                        <p className="text-sm font-medium text-foreground leading-relaxed">
+                          Choose how the simulator draws from your history.
+                        </p>
+                        <div className="space-y-2 text-xs text-muted-foreground">
+                          <p>
+                            <strong className="text-foreground">
+                              Stationary blocks (recommended):
+                            </strong>{" "}
+                            Keeps short runs of neighboring {blockStepUnit} together (
+                            {blockLengthText}), so historic loss streaks and hot streaks survive
+                            into the simulation. This mainly changes the spread and the tails of the
+                            results — drawdowns and best/worst cases — not the typical outcome.
+                          </p>
+                          <p>
+                            <strong className="text-foreground">Independent trades:</strong> A fully
+                            random shuffle. Every draw is independent, so real-life clustering of
+                            wins and losses is broken up.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </HoverCardContent>
+                </HoverCard>
+              </div>
+              <Select
+                value={resampleMode}
+                onValueChange={(value) => setResampleMode(value as "iid" | "stationary-block")}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="stationary-block">Stationary blocks (recommended)</SelectItem>
+                  <SelectItem value="iid">Independent trades</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {resampleMode === "stationary-block"
+                  ? `Keeps neighboring ${blockStepUnit} together — ${blockLengthText}`
+                  : "Fully random shuffle — every draw is independent"}
               </p>
             </div>
 
@@ -1407,6 +1651,111 @@ export default function RiskSimulatorPage() {
                     </div>
                     <p className="text-xs text-muted-foreground">Enable for reproducible results</p>
                   </div>
+
+                  {/* Mean Block Length */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="mean-block-length">Mean Block Length</Label>
+                      <HoverCard>
+                        <HoverCardTrigger asChild>
+                          <HelpCircle className="h-3.5 w-3.5 text-muted-foreground/60 cursor-help" />
+                        </HoverCardTrigger>
+                        <HoverCardContent className="w-80 p-0 overflow-hidden">
+                          <div className="space-y-3">
+                            <div className="bg-primary/5 border-b px-4 py-3">
+                              <h4 className="text-sm font-semibold text-primary">
+                                Mean Block Length
+                              </h4>
+                            </div>
+                            <div className="px-4 pb-4 space-y-3">
+                              <p className="text-sm font-medium text-foreground leading-relaxed">
+                                Average number of consecutive {blockStepUnit} kept together per
+                                block when resampling with stationary blocks.
+                              </p>
+                              <p className="text-xs text-muted-foreground leading-relaxed">
+                                Leave blank to let the simulator pick automatically based on how
+                                much history you have (about {autoBlockLength} for your current
+                                pool). Larger blocks preserve longer streaks; a length of 1 behaves
+                                like independent draws. This setting is ignored when resampling is
+                                set to independent trades.
+                              </p>
+                            </div>
+                          </div>
+                        </HoverCardContent>
+                      </HoverCard>
+                    </div>
+                    <Input
+                      id="mean-block-length"
+                      type="number"
+                      value={meanBlockLength ?? ""}
+                      placeholder={`Auto (${autoBlockLength})`}
+                      onChange={(e) => {
+                        const next = parseInt(e.target.value, 10);
+                        setMeanBlockLength(Number.isFinite(next) && next >= 1 ? next : null);
+                      }}
+                      min={1}
+                      max={1000}
+                      className="w-40"
+                      disabled={resampleMode !== "stationary-block"}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {describeBlockLengthSetting(
+                        blockLengthHint,
+                        resampleMode === "stationary-block",
+                      )}
+                    </p>
+                  </div>
+
+                  {/* Ruin Threshold */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="ruin-threshold">Ruin Threshold (%)</Label>
+                      <HoverCard>
+                        <HoverCardTrigger asChild>
+                          <HelpCircle className="h-3.5 w-3.5 text-muted-foreground/60 cursor-help" />
+                        </HoverCardTrigger>
+                        <HoverCardContent className="w-80 p-0 overflow-hidden">
+                          <div className="space-y-3">
+                            <div className="bg-primary/5 border-b px-4 py-3">
+                              <h4 className="text-sm font-semibold text-primary">Ruin Threshold</h4>
+                            </div>
+                            <div className="px-4 pb-4 space-y-3">
+                              <p className="text-sm font-medium text-foreground leading-relaxed">
+                                Define how deep a decline from starting capital counts as ruin.
+                              </p>
+                              <p className="text-xs text-muted-foreground leading-relaxed">
+                                For example, 50 means an account that ever falls 50% below its
+                                starting value is counted as ruined, even if it later recovers. When
+                                set, the results include a Probability of Ruin card showing what
+                                fraction of simulations ever touched that line. Leave blank to skip
+                                this statistic.
+                              </p>
+                            </div>
+                          </div>
+                        </HoverCardContent>
+                      </HoverCard>
+                    </div>
+                    <Input
+                      id="ruin-threshold"
+                      type="number"
+                      value={ruinThresholdPercent ?? ""}
+                      placeholder="Off"
+                      onChange={(e) => {
+                        const next = parseInt(e.target.value, 10);
+                        setRuinThresholdPercent(
+                          Number.isFinite(next) && next >= 1 && next <= 100 ? next : null,
+                        );
+                      }}
+                      min={1}
+                      max={100}
+                      className="w-40"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {ruinThresholdPercent !== null
+                        ? `A path ever down ${ruinThresholdPercent}% from starting capital counts as ruined`
+                        : "Optional: percent decline from starting capital that counts as ruin"}
+                    </p>
+                  </div>
                 </div>
               </AccordionContent>
             </AccordionItem>
@@ -1508,11 +1857,12 @@ export default function RiskSimulatorPage() {
               initialCapital={initialCapital}
               scaleType={scaleType}
               showIndividualPaths={showIndividualPaths}
+              originalOrder={originalOrder}
             />
           </Card>
 
           {/* Statistics Cards */}
-          <StatisticsCards result={result} />
+          <StatisticsCards result={result} originalOrder={originalOrder} />
 
           {/* Distribution Charts */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -1531,11 +1881,13 @@ function EquityCurveChart({
   initialCapital,
   scaleType,
   showIndividualPaths,
+  originalOrder,
 }: {
   result: MonteCarloResult;
   initialCapital: number;
   scaleType: "linear" | "log";
   showIndividualPaths: boolean;
+  originalOrder: OriginalOrderPath | null;
 }) {
   const { theme } = useTheme();
   const isDark = theme === "dark";
@@ -1619,6 +1971,27 @@ function EquityCurveChart({
       hoverinfo: "skip",
     });
 
+    // Actual historical path in original order, so the simulated fan is
+    // anchored to what really happened. Truncated to the simulated horizon
+    // when the history is longer.
+    if (originalOrder && originalOrder.equity.length > 0) {
+      const overlayLength = Math.min(originalOrder.equity.length, percentiles.steps.length);
+      const truncated = originalOrder.stepCount > overlayLength;
+      const overlayName = truncated
+        ? `Actual, first ${overlayLength} of ${originalOrder.stepCount} ${originalOrder.stepUnit}`
+        : "Actual (original order)";
+
+      traces.push({
+        x: percentiles.steps.slice(0, overlayLength),
+        y: originalOrder.equity.slice(0, overlayLength),
+        type: "scatter",
+        mode: "lines",
+        name: overlayName,
+        line: { color: isDark ? "#fbbf24" : "#d97706", width: 2.5, dash: "dashdot" },
+        hovertemplate: "<b>Actual</b><br>Step: %{x}<br>Value: $%{y:,.0f}<extra></extra>",
+      });
+    }
+
     const plotLayout = {
       paper_bgcolor: isDark ? "#020817" : "#ffffff",
       plot_bgcolor: isDark ? "#020817" : "#ffffff",
@@ -1670,7 +2043,7 @@ function EquityCurveChart({
     };
 
     return { data: traces, layout: plotLayout };
-  }, [result, initialCapital, scaleType, showIndividualPaths, isDark]);
+  }, [result, initialCapital, scaleType, showIndividualPaths, originalOrder, isDark]);
 
   return (
     <div className="w-full">
