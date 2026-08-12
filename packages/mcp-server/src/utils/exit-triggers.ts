@@ -8,6 +8,7 @@
  */
 
 import type { PnlPoint, ReplayLeg } from "./trade-replay.ts";
+import { applyRatioField, formatMoney, formatPercent, fromMoney, toMoneyField } from "./money.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,12 +187,19 @@ export function evaluateProfitAction(
   }
 
   const scale = trigger.unit === "percent" ? Math.abs(trigger.entryCost!) : 1;
+  // Each step's arm and stop enter the money domain where they are DERIVED, so
+  // the threshold reported back is the threshold compared against.
+  const entryCostMoney = trigger.unit === "percent" ? toMoneyField(scale, "entry cost") : 0;
+  const stepDollars = (value: number, field: string): number =>
+    trigger.unit === "percent"
+      ? fromMoney(applyRatioField(entryCostMoney, value, field))
+      : fromMoney(toMoneyField(value, field));
 
   const normalizedSteps = [...trigger.steps]
     .sort((a, b) => a.armAt - b.armAt)
     .map((step) => ({
-      armAt: step.armAt * scale,
-      stopAt: step.stopAt * scale,
+      armAt: stepDollars(step.armAt, "steps.armAt"),
+      stopAt: stepDollars(step.stopAt, "steps.stopAt"),
       closeAllocationPct: step.closeAllocationPct,
     }));
 
@@ -209,7 +217,12 @@ export function evaluateProfitAction(
     // Check each step for partial close (only when armAt first reached)
     for (let s = 0; s < normalizedSteps.length; s++) {
       const step = normalizedSteps[s];
-      if (!stepPartialFired[s] && step.closeAllocationPct && runningMaxPnl >= step.armAt) {
+      if (
+        !stepPartialFired[s] &&
+        step.closeAllocationPct &&
+        Number.isFinite(runningMaxPnl) &&
+        runningMaxPnl >= step.armAt
+      ) {
         stepPartialFired[s] = true;
         const closeAmt = remainingAllocation * step.closeAllocationPct;
         partialCloses.push({
@@ -223,10 +236,15 @@ export function evaluateProfitAction(
     }
 
     // Compute active stop floor (same logic as original)
+    // The running maximum starts as an UNARMED SENTINEL, not an amount, and only
+    // a real point sets one. It is therefore never converted into the money
+    // domain, which correctly refuses a non-finite input.
     let activeFloor = -Infinity;
-    for (const step of normalizedSteps) {
-      if (runningMaxPnl >= step.armAt) {
-        activeFloor = Math.max(activeFloor, step.stopAt);
+    if (Number.isFinite(runningMaxPnl)) {
+      for (const step of normalizedSteps) {
+        if (runningMaxPnl >= step.armAt) {
+          activeFloor = Math.max(activeFloor, step.stopAt);
+        }
       }
     }
 
@@ -237,8 +255,8 @@ export function evaluateProfitAction(
       const effectivePnl = pnl * remainingAllocation;
       const detail =
         trigger.unit === "percent"
-          ? `Profit action: stop adjusted to ${((activeFloor / scale) * 100).toFixed(0)}% ($${activeFloor.toFixed(2)}) at max P&L $${runningMaxPnl.toFixed(2)}, hit at $${pnl.toFixed(2)} (remaining ${(remainingAllocation * 100).toFixed(0)}%)`
-          : `Profit action: stop adjusted to $${activeFloor.toFixed(2)} at max P&L $${runningMaxPnl.toFixed(2)}, hit at $${pnl.toFixed(2)} (remaining ${(remainingAllocation * 100).toFixed(0)}%)`;
+          ? `Profit action: stop adjusted to ${formatPercent(activeFloor / scale)} ($${formatMoney(toMoneyField(activeFloor, "steps.stopAt"))}) at max P&L $${runningMaxPnl.toFixed(2)}, hit at $${pnl.toFixed(2)} (remaining ${(remainingAllocation * 100).toFixed(0)}%)`
+          : `Profit action: stop adjusted to $${formatMoney(toMoneyField(activeFloor, "steps.stopAt"))} at max P&L $${runningMaxPnl.toFixed(2)}, hit at $${pnl.toFixed(2)} (remaining ${(remainingAllocation * 100).toFixed(0)}%)`;
 
       return {
         fireEvent: {
@@ -296,16 +314,24 @@ export function evaluateTrigger(
         // unit='percent' requires entryCost; if missing, cannot compute — no fire
         if (trigger.unit === "percent" && trigger.entryCost == null) break;
         const requiredHits = trigger.requiredHits ?? 2;
-        const dollarThresholdPT =
-          trigger.unit === "percent" ? threshold * Math.abs(trigger.entryCost!) : threshold;
-        if (pnl >= dollarThresholdPT) {
+        // The threshold enters the money domain where it is DERIVED, so the
+        // figure reported below is the figure compared against.
+        const ptThresholdMoney =
+          trigger.unit === "percent"
+            ? applyRatioField(
+                toMoneyField(Math.abs(trigger.entryCost!), "entry cost"),
+                threshold,
+                "threshold",
+              )
+            : toMoneyField(threshold, "threshold");
+        if (pnl >= fromMoney(ptThresholdMoney)) {
           if (point.allLegsSync !== false) profitTargetHits++;
           if (profitTargetHits < requiredHits) break;
           fired = true;
           detail =
             trigger.unit === "percent"
-              ? `P&L $${pnl.toFixed(2)} >= ${(threshold * 100).toFixed(0)}% of $${Math.abs(trigger.entryCost!).toFixed(2)} ($${dollarThresholdPT.toFixed(2)})`
-              : `P&L $${pnl.toFixed(2)} >= target $${dollarThresholdPT.toFixed(2)}`;
+              ? `P&L $${pnl.toFixed(2)} >= ${formatPercent(threshold)} of $${formatMoney(toMoneyField(Math.abs(trigger.entryCost!), "entry cost"))} ($${formatMoney(ptThresholdMoney)})`
+              : `P&L $${pnl.toFixed(2)} >= target $${formatMoney(ptThresholdMoney)}`;
         } else if (point.allLegsSync !== false) {
           profitTargetHits = 0;
         }
@@ -317,24 +343,38 @@ export function evaluateTrigger(
         const absThreshold = Math.abs(threshold);
         // unit='percent' requires entryCost; if missing, cannot compute — no fire
         if (trigger.unit === "percent" && trigger.entryCost == null) break;
-        const dollarThresholdSL =
-          trigger.unit === "percent" ? absThreshold * Math.abs(trigger.entryCost!) : absThreshold;
-        if (pnl <= -dollarThresholdSL) {
+        // Derived in the money domain for the same reason: a 1% stop on a $35
+        // entry cost is thirty-five cents, and a position at exactly -$0.35 has
+        // reached the stop the caller was shown.
+        const slThresholdMoney =
+          trigger.unit === "percent"
+            ? applyRatioField(
+                toMoneyField(Math.abs(trigger.entryCost!), "entry cost"),
+                absThreshold,
+                "threshold",
+              )
+            : toMoneyField(absThreshold, "threshold");
+        if (pnl <= -fromMoney(slThresholdMoney)) {
           fired = true;
           detail =
             trigger.unit === "percent"
-              ? `P&L $${pnl.toFixed(2)} <= -${(absThreshold * 100).toFixed(0)}% of $${Math.abs(trigger.entryCost!).toFixed(2)} (-$${dollarThresholdSL.toFixed(2)})`
-              : `P&L $${pnl.toFixed(2)} <= stop -$${dollarThresholdSL.toFixed(2)}`;
+              ? `P&L $${pnl.toFixed(2)} <= -${formatPercent(absThreshold)} of $${formatMoney(toMoneyField(Math.abs(trigger.entryCost!), "entry cost"))} (-$${formatMoney(slThresholdMoney)})`
+              : `P&L $${pnl.toFixed(2)} <= stop -$${formatMoney(slThresholdMoney)}`;
         }
         break;
       }
 
       case "trailingStop": {
         const trailAmt = trigger.trailAmount ?? threshold;
-        const dropdown = runningMaxPnl - pnl;
-        if (dropdown >= trailAmt && runningMaxPnl > -Infinity) {
+        // The peak must be a real amount rather than the unarmed sentinel before
+        // the raw P&L drop can be compared with the validated trail.
+        const trailArmed = Number.isFinite(runningMaxPnl);
+        const dropdown = trailArmed ? runningMaxPnl - pnl : 0;
+        // trailAmount and threshold are used as DOLLARS here whatever `unit`
+        // says, so they are validated as dollars whatever `unit` says.
+        if (trailArmed && dropdown >= fromMoney(toMoneyField(trailAmt, "trailAmount"))) {
           fired = true;
-          detail = `Dropdown $${dropdown.toFixed(2)} from max $${runningMaxPnl.toFixed(2)} >= trail $${trailAmt.toFixed(2)}`;
+          detail = `Dropdown $${dropdown.toFixed(2)} from max $${runningMaxPnl.toFixed(2)} >= trail $${formatMoney(toMoneyField(trailAmt, "trailAmount"))}`;
         }
         break;
       }
@@ -657,11 +697,18 @@ export function analyzeExitTriggers(config: {
   if (!firstToFire) {
     summary = `No triggers fired across ${pnlPath.length} data points.`;
   } else if (actualExit) {
-    const betterWorse = actualExit.pnlDifference > 0 ? "better" : "worse";
+    // Zero is neither better nor worse. Reporting an identical exit as "$0.00
+    // worse" is a false statement about the trade.
+    const betterWorse =
+      actualExit.pnlDifference > 0 ? "better" : actualExit.pnlDifference < 0 ? "worse" : "the same";
     summary =
       `${firstToFire.type} fired at ${firstToFire.firedAt} (P&L $${firstToFire.pnlAtFire.toFixed(2)}). ` +
       `Actual exit at ${actualExit.timestamp} (P&L $${actualExit.pnl.toFixed(2)}). ` +
-      `Trigger was $${Math.abs(actualExit.pnlDifference).toFixed(2)} ${betterWorse}.`;
+      `Trigger was ${
+        actualExit.pnlDifference === 0
+          ? "the same"
+          : `$${Math.abs(actualExit.pnlDifference).toFixed(2)} ${betterWorse}`
+      }.`;
   } else {
     summary =
       `${firstToFire.type} fired first at ${firstToFire.firedAt} (P&L $${firstToFire.pnlAtFire.toFixed(2)}). ` +

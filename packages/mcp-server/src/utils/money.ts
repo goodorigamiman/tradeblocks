@@ -1,0 +1,138 @@
+/**
+ * Exact derivation of the dollar thresholds exit analysis compares against.
+ *
+ * An exit threshold is decimal money: a decimal percentage of a decimal entry
+ * cost, reported back to the caller in decimals. Deriving it in binary floating
+ * point produces a threshold that is not the one anybody asked for.
+ *
+ * The concrete failure this exists to remove: a 1% stop against a $35 entry cost
+ * evaluates to `0.35000000000000003`, while the analysis reports the threshold as
+ * `-$0.35`. A position whose P&L is exactly `-$0.35` therefore sits a hair inside
+ * a stop it is being told it has reached, and the analysis answers that the stop
+ * did not fire. The comparison and the reported figure were different numbers.
+ *
+ * SCOPE, AND WHY IT STOPS WHERE IT DOES. This module governs the monetary amounts
+ * this tool converts or derives — direct thresholds and trails, percentage
+ * thresholds from an entry cost, and a step's arm and stop. It deliberately does
+ * not touch the P&L path, which arrives already computed from the replay. Making
+ * claims about the intended decimal value of a number this tool did not compute
+ * means inventing a rounding policy for values with no ground truth, and every
+ * such rule has an edge: promoting a sub-micro P&L to keep its sign flips its
+ * decision against a one-micro threshold, while rounding it to zero flips its
+ * decision against a zero threshold. Neither is correct, because the question is
+ * unanswerable from here. So the tool derives its own fixed-point thresholds
+ * exactly, compares the P&L it was handed against them as given, and claims
+ * nothing further.
+ *
+ * REPRESENTATION. A fixed-point integer count of micro-dollars (1e-6 USD) held in
+ * an ordinary number. Integers below 2^53 are exact, covering roughly
+ * $9,007,199,254 — far beyond any position these tools analyse — and the guards
+ * below fail loudly rather than silently losing precision in that integer count.
+ * Micro-dollars rather than cents is deliberate: option-price midpoints can land
+ * on half-cent increments, so a percentage of an entry cost routinely lands on
+ * fractions of a cent, and a cent domain would have to round real money away.
+ *
+ * RESOLUTION. Every finite amount in range resolves to the nearest micro-dollar.
+ * Comparison and reporting are then produced from that same exact integer value.
+ * This applies equally to a configured dollar amount and to a value produced by
+ * earlier caller or handler arithmetic: `$0.0000006` resolves to `$0.000001`, and
+ * binary noise around a micro-dollar resolves to that micro-dollar. The boundary
+ * does not try to infer which finer digits are intentional because the number
+ * alone cannot answer that question.
+ */
+
+/** Micro-dollars per dollar. */
+const SCALE = 1_000_000;
+
+/** Largest whole-dollar magnitude whose scaled count is a safe integer. */
+const MONEY_MAX_DOLLARS = Math.floor(Number.MAX_SAFE_INTEGER / SCALE);
+
+/** A monetary amount as an exact integer count of micro-dollars. */
+export type Money = number;
+
+/**
+ * Raised when an amount cannot be carried in this domain. Tool handlers return
+ * it as an error message identifying the affected field.
+ */
+export class MoneyDomainError extends Error {}
+
+/**
+ * Bring a dollar amount into the domain, naming the field it came from.
+ *
+ * Non-finite inputs and values beyond the exact integer range are refused. Every
+ * other amount resolves to the nearest micro-dollar, including amounts finer than
+ * that resolution and binary noise left by arithmetic before this boundary.
+ */
+export function toMoneyField(amount: number, field: string): Money {
+  if (!Number.isFinite(amount)) {
+    throw new MoneyDomainError(`${field} must be a finite dollar amount`);
+  }
+  const scaled = Math.round(amount * SCALE);
+  if (!Number.isSafeInteger(scaled)) {
+    throw new MoneyDomainError(
+      `${field} is beyond the largest dollar amount this analysis can represent (about ${MONEY_MAX_DOLLARS.toLocaleString("en-US")})`,
+    );
+  }
+  return scaled === 0 ? 0 : scaled;
+}
+
+/**
+ * Apply a caller-supplied ratio to a monetary amount, naming the field.
+ *
+ * A percentage is a ratio rather than money, so it is required to be finite but
+ * is not constrained to the monetary grid. The dollars it produces are, and that
+ * product is where an unusable percentage actually bites.
+ */
+export function applyRatioField(amount: Money, ratio: number, field: string): Money {
+  if (!Number.isFinite(ratio)) {
+    throw new MoneyDomainError(`${field} must be a finite number`);
+  }
+  return toMoneyField(fromMoney(amount) * ratio, field);
+}
+
+/** Convert back to dollars, for comparison against a P&L and for reporting. */
+export function fromMoney(value: Money): number {
+  return value / SCALE;
+}
+
+/**
+ * Render a derived threshold with up to six decimal places.
+ *
+ * Two decimals stays the house style: a whole number of cents formats exactly as
+ * `toFixed(2)` always did. At ordinary position sizes, a value carrying real
+ * sub-cent precision keeps its digits, so the figure reported is the figure
+ * compared — a stepped floor of `$0.175` reports as `$0.175` rather than as
+ * `$0.17` or `$0.18`.
+ *
+ * At the extreme edge of the safe-integer domain, converting the integer count
+ * back to a binary dollar number can shift the final micro-dollar before it is
+ * formatted. That range is far above the position sizes this module is designed
+ * to analyse, but the safe-integer guard does not prevent that display effect.
+ */
+export function formatMoney(value: Money): string {
+  if (value % 10_000 === 0) return (value / SCALE).toFixed(2);
+  return (value / SCALE).toFixed(6).replace(/(\.\d\d[0-9]*?)0+$/, "$1");
+}
+
+/** Render a configured ratio as a percentage without rounding it. */
+export function formatPercent(ratio: number): string {
+  const negative = ratio < 0;
+  const [coefficient, exponentText] = Math.abs(ratio).toString().split("e");
+  const exponent = Number(exponentText ?? 0);
+  const decimalAt = coefficient.indexOf(".");
+  const digits = coefficient.replace(".", "");
+  const shiftedDecimalAt = (decimalAt === -1 ? digits.length : decimalAt) + exponent + 2;
+
+  let percentage: string;
+  if (shiftedDecimalAt <= 0) {
+    percentage = `0.${"0".repeat(-shiftedDecimalAt)}${digits}`;
+  } else if (shiftedDecimalAt >= digits.length) {
+    percentage = `${digits}${"0".repeat(shiftedDecimalAt - digits.length)}`;
+  } else {
+    percentage = `${digits.slice(0, shiftedDecimalAt)}.${digits.slice(shiftedDecimalAt)}`;
+  }
+
+  percentage = percentage.replace(/^0+(?=\d)/, "");
+  if (percentage.includes(".")) percentage = percentage.replace(/0+$/, "").replace(/\.$/, "");
+  return `${negative ? "-" : ""}${percentage}%`;
+}
