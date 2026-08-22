@@ -31,6 +31,7 @@ import type { SpotStore } from "../market/stores/spot-store.ts";
 import { isRealMarketSessionDate } from "../market/provenance/dataset-registry.ts";
 import {
   enumerateXnysSessions,
+  isXnysSessionDate,
   XNYS_SESSION_CALENDAR_SUPPORTED_FROM,
   XNYS_SESSION_CALENDAR_SUPPORTED_THROUGH,
 } from "../market/provenance/xnys-session-calendar.ts";
@@ -599,6 +600,49 @@ function parseDateStr(dateStr: string): Date | null {
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return null;
   return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+}
+
+const ISO_CALENDAR_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Normalize an OHLCV row's date value to a validated YYYY-MM-DD string at the
+ * rawRows boundary. The legacy SQL fallback reads `market.spot_daily`, which
+ * may be a view over Hive-partitioned Parquet whose `date` partition value
+ * DuckDB auto-casts to DATE; the node-api reader then yields a DuckDBDateValue
+ * object (JSON-shape `{"days":N}`), not a string. Every downstream consumer
+ * (zero-OHLC guard, session filter, watermark comparisons, writeRows) assumes
+ * real strings, so conversion happens once here — never at call sites.
+ */
+function normalizeMarketRowDate(value: unknown): string {
+  if (typeof value === "string" && ISO_CALENDAR_DATE_RE.test(value)) {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    if (Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value) {
+      return value;
+    }
+  }
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  // DuckDB DATE internal repr: int32 days since 1970-01-01 UTC
+  const days = (value as { days?: unknown } | null)?.days;
+  if (typeof days === "number" && Number.isInteger(days)) {
+    const iso = new Date(days * 24 * 60 * 60 * 1_000).toISOString().slice(0, 10);
+    // Plausibility bound, not calendar authority: dates outside the XNYS
+    // supported range are legitimate (legacy history stays usable), so
+    // 1900-2100 deliberately brackets any plausible trade history while
+    // making corrupt vendor day counts refuse loudly instead of producing
+    // valid-looking far-future dates that no downstream stage questions.
+    const year = Number(iso.slice(0, 4));
+    if (year < 1900 || year > 2100) {
+      throw new TypeError(
+        `OHLCV source returned an implausible DuckDB DATE ${iso}: ${days} days since 1970-01-01 UTC falls outside the plausible 1900-2100 window`,
+      );
+    }
+    return iso;
+  }
+  throw new TypeError(
+    `OHLCV source returned a date that is not a real calendar date: ${JSON.stringify(value)}`,
+  );
 }
 
 // =============================================================================
@@ -1463,6 +1507,14 @@ export async function runEnrichment(
       rawRows = rawReader.getRows();
     }
 
+    // 3a. Boundary normalization: the SQL fallback may read `market.spot_daily`
+    // over a Hive-partitioned Parquet view whose DATE-typed partition values
+    // arrive as DuckDBDateValue objects. Convert every row's date to a
+    // validated YYYY-MM-DD string once here so all downstream steps (zero-OHLC
+    // guard, session filter, watermark comparisons, array construction) see
+    // real strings regardless of which OHLCV source produced the rows.
+    rawRows = rawRows.map((r) => [r[0], normalizeMarketRowDate(r[1]), r[2], r[3], r[4], r[5]]);
+
     if (rawRows.length === 0) {
       return {
         ticker,
@@ -1497,6 +1549,38 @@ export async function runEnrichment(
       );
     }
     rawRows = filteredRawRows;
+
+    // 3c. XNYS session filter. The indicator arrays must contain only genuine
+    // trading sessions so that "one position back" means "the prior session",
+    // never "the prior partition". The VIX spot feed carries priced full-day
+    // holiday partitions; without this filter the session after a holiday
+    // lags to the holiday's close (Prior_Close, Gap_Pct, Prev_Return_Pct,
+    // Prior_Range_vs_ATR) and every windowed indicator (RSI_14, ATR_Pct,
+    // EMA21, SMA50, Realized_Vol_5D/20D, Return_5D/20D) spans the wrong days.
+    // Canonical Parquet spot reads already exclude non-sessions at the store
+    // layer (SpotStore.buildDirectParquetReadBarsSQL); this second line of
+    // defense covers the legacy market.spot_daily fallback and store
+    // backends without partition-level calendar authority (DuckdbSpotStore).
+    // Dates outside the calendar revision's supported range are kept
+    // unfiltered — same doctrine as isCompleteXnysWindow: legacy physical
+    // data stays usable where the calendar authority has no opinion.
+    const sessionFilteredRawRows = rawRows.filter((r) => {
+      const date = r[1] as string;
+      if (
+        date < XNYS_SESSION_CALENDAR_SUPPORTED_FROM ||
+        date > XNYS_SESSION_CALENDAR_SUPPORTED_THROUGH
+      ) {
+        return true;
+      }
+      return isXnysSessionDate(date);
+    });
+    const nonSessionRowsDropped = rawRows.length - sessionFilteredRawRows.length;
+    if (nonSessionRowsDropped > 0) {
+      console.warn(
+        `[market-enricher] ticker=${ticker} dropped ${nonSessionRowsDropped} non-XNYS-session rows before indicator math`,
+      );
+    }
+    rawRows = sessionFilteredRawRows;
 
     // 4. Extract typed arrays from raw rows
     // Columns: ticker(0), date(1), open(2), high(3), low(4), close(5)
