@@ -120,6 +120,9 @@ export interface AnalysisConfig {
   riskFreeRateAnnualPct?: number;
 }
 
+/** Which curve supplies both halves of `calmarRatio`: the daily log's marked curve, or realized trade equity. */
+export type CalmarBasis = "daily_log_marked_curve" | "realized_trade_equity";
+
 export interface PortfolioCalculationMethodology {
   pnl: {
     netPlBasis: "net_after_fees";
@@ -137,6 +140,9 @@ export interface PortfolioCalculationMethodology {
     observations: number;
     dateRange: { start: string | null; end: string | null };
     idleDays: "included_as_provided" | "included_business_days" | "included_calendar_days";
+  };
+  calmar: {
+    basis: CalmarBasis;
   };
   sharpe: {
     annualizationFactor: number;
