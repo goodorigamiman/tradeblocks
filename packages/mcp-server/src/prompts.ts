@@ -9,6 +9,8 @@ import { z } from "zod";
 
 // Owned by the tradeblocks-skills plugin (#4167); the server does not install or invoke it.
 const captureSkill = "/tradeblocks:oo-capture";
+// Pinned older plugin installs have oo-capture without saved-portfolio capture.
+const portfolioCaptureCondition = `the running client's ${captureSkill} skill describes saved-portfolio capture (older plugin versions capture only saved backtests and runs)`;
 const optimumSkill = "/tradeblocks:is-this-optimum-real";
 
 const dataIntegrity = `Keep Option Omega (OO) and TradeBlocks (TB) evidence separate.
@@ -205,15 +207,18 @@ get_portfolio_results by that runId. get_portfolio_results takes only a runId;
 never pass it a savedPortfolioId. Given an ooId, try it as a savedPortfolioId
 with get_saved_portfolio first, and treat it as a runId only if OO has no saved
 portfolio with that ID. Given a block, check it with get_block_info: use that
-block if it exists, otherwise use it as the imported block's name. Use an existing TradeBlocks block if it
-contains that portfolio's economic trades; otherwise ask the user to export the
-portfolio trade-log CSV from OO and save it at a path readable by the TB server
-(Docker/HTTP: inside the mounted server data directory), then use import_csv.
-Do not claim the saved-backtest capture skill captures portfolios; it does not.
-If the portfolio CSV is unavailable, stop without a stress verdict; never build
-it from OO get_trade_log responses. Use list_blocks and get_block_info to
-select/verify the block, then TB portfolio_health_check, stress_test,
-drawdown_attribution, get_correlation_matrix, get_tail_risk and
+block if it exists, otherwise use it as the imported block's name. Use an
+existing TradeBlocks block if it contains that portfolio's economic trades.
+Otherwise, when ${portfolioCaptureCondition}, that skill can capture a saved
+portfolio as a strategy-labelled block with its whole-book daily curve. Without
+the plugin, or with an older oo-capture, ask the user for OO's portfolio
+trade-log CSV at a path
+readable by the TB server (Docker/HTTP: inside the mounted data directory),
+and import_csv, including dailyLogPath if the daily-log CSV is available.
+If neither capture nor a server-readable CSV is available, stop without a
+stress verdict; never build it from OO get_trade_log responses. Use list_blocks
+and get_block_info to select/verify the block, then TB portfolio_health_check,
+stress_test, drawdown_attribution, get_correlation_matrix, get_tail_risk and
 marginal_contribution as applicable to the block's strategies and history.
 Explain missing coverage, scenario assumptions and trade-realized limitations;
 do not mistake historical closed-trade stress for intratrade or marked-account
@@ -273,6 +278,95 @@ slippage verdict. Slippage here is live P/L versus the
 reference's per-trade realized P/L, per contract, not OO's marked equity;
 matching within one minute is order-dependent. The tools use the block's
 recorded P/L basis: deduct no fees yourself.
+${dataIntegrity}`,
+          },
+        },
+      ],
+    }),
+  );
+
+  register(
+    "allocate-oo-portfolio",
+    {
+      title: "Allocate an OO portfolio",
+      description:
+        "Propose strategy allocations from TradeBlocks and check them in an OO portfolio run",
+      argsSchema: {
+        ooId: z
+          .string()
+          .optional()
+          .describe("OO savedPortfolioId or a scratch portfolio runId; try the saved ID first"),
+        block: z
+          .string()
+          .optional()
+          .describe("TradeBlocks block ID with this portfolio's member strategies, or import name"),
+      },
+    },
+    (args) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `Find allocations for the requested Option Omega (OO) portfolio.
+Use TradeBlocks (TB) as a proposal lab and OO as the portfolio check.
+${givenArguments(args)}Identify the source and baseline first. For a saved
+portfolio, use OO list_portfolios and get_saved_portfolio with savedPortfolioId
+to read its member savedBacktestId values, settings, existing allocations and
+OO headline figures. For a scratch portfolio runId, wait on
+get_portfolio_status, then read get_portfolio_results; never pass a
+savedPortfolioId to get_portfolio_results. If ooId was supplied, try it as a
+savedPortfolioId first, then as a runId only if no saved portfolio has that ID.
+Ask the user when source, block or constraints are ambiguous.
+
+Use list_blocks and get_block_info to identify a TB block containing all of
+this portfolio's economic member trades under distinct, case-insensitively
+unique Strategy labels. Check the label-to-OO-member mapping; two members with
+the same name must not merge. When ${portfolioCaptureCondition}, use that
+skill for a saved OO portfolio to obtain a strategy-labelled block and the
+whole-book marked daily curve. Otherwise (no plugin, or an older oo-capture)
+ask for the portfolio's OO trade-log CSV export and optional
+daily-log CSV export at paths readable by the TB server (Docker/HTTP: inside
+the mounted data directory); call import_csv with csvPath, blockName and
+dailyLogPath when available. If the CSV is unavailable or member labels cannot
+be distinguished, stop the allocation proposal rather than transcribing OO
+trade rows or inventing membership. Without the daily log, say the block has
+no marked book curve.
+
+On that verified block, use get_correlation_matrix, marginal_contribution and
+get_tail_risk to diagnose overlap, marginal risk/return and joint tails; use
+what_if_scaling and portfolio_health_check where supported to form a small,
+explicit set of candidate allocation percentages, including the unchanged
+baseline. State each candidate's member IDs, percentage changes, comparison
+window, assumptions and trade coverage. TB's correlation, marginal, tail,
+what-if and health results are trade-derived counterfactuals, not OO's marked
+equity or OO headline figures. The daily log is a whole-book curve only; it
+has no per-member marks. A TB proposal is a lead, never a verdict.
+
+For each candidate, call OO run_portfolio with
+{ parameters: { strategies: [{ savedBacktestId, allocationPercentage }, ...],
+rangeStart, rangeEnd, startingFunds, ... } }. Take savedBacktestId from the
+saved OO members (list_backtests if needed); retain the baseline's portfolio
+settings and member sizing overrides other than the intended allocation
+changes. The strategies share one startingFunds pool in OO;
+allocationPercentage is each strategy's share of current funds per new trade
+and percentages need not total 100. Do not sum standalone results or
+substitute TB what-if scaling for the shared-funds run. Do not duplicate a run
+while it is pending. Use the runId returned by run_portfolio with
+get_portfolio_status, waiting pollAfterMs between calls until status is
+complete, failed or cancelled. For complete only, call get_portfolio_results
+with { runId } and read the OO book metrics and strategyResults. A candidate is
+OO-tested only after get_portfolio_status reports complete and
+get_portfolio_results for that run has been read; failed, cancelled or unread
+runs remain untested. Compare candidates to the baseline on OO's same window
+and capital, label OO and TB numbers separately and explain changed exposure,
+sample/selection limits and any missing evidence. One OO run is a diagnostic,
+not a causal finding; a mechanism claim needs a direct lever test and
+discrimination against confounds.
+
+Never save, replace, archive or delete the user's saved portfolio. Only if
+the user explicitly asks to save a candidate, create a new portfolio; never
+replace the original.
 ${dataIntegrity}`,
           },
         },
