@@ -13,7 +13,7 @@
 
 // Database configuration
 export const DB_NAME = "TradeBlocksDB";
-export const DB_VERSION = 5;
+export const DB_VERSION = 6;
 
 // Object store names
 export const STORES = {
@@ -190,6 +190,58 @@ export async function initializeDatabase(): Promise<IDBDatabase> {
 
       if (!db.objectStoreNames.contains(STORES.PUBLISHED_RATES)) {
         db.createObjectStore(STORES.PUBLISHED_RATES);
+      }
+
+      if (event.oldVersion < 6) {
+        const trades = transaction.objectStore(STORES.TRADES);
+        const tradeCursor = trades.openCursor();
+        tradeCursor.onsuccess = () => {
+          const cursor = tradeCursor.result;
+          if (!cursor) return;
+          const trade = cursor.value;
+          let changed = Object.hasOwn(trade, "premiumPrecision");
+          // v5 divided "cents"-tagged premiums by 100, then applied its option-multiplier heuristic
+          // to every record. Rescale each premium so existing blocks keep the totals v5 displayed.
+          if (typeof trade.premium === "number" && isFinite(trade.premium)) {
+            const cents = trade.premiumPrecision === "cents";
+            const count =
+              typeof trade.numContracts === "number" && isFinite(trade.numContracts)
+                ? Math.abs(trade.numContracts)
+                : 0;
+            const contracts = count > 0 ? count : 1;
+            const total = (Math.abs(trade.premium) / (cents ? 100 : 1)) * contracts;
+            const margin =
+              typeof trade.marginReq === "number" && isFinite(trade.marginReq)
+                ? Math.abs(trade.marginReq)
+                : 0;
+            const multiplied =
+              isFinite(total) &&
+              total > 0 &&
+              (margin > 0 ? total / margin > 0 && total / margin < 0.5 : total < 5000);
+            if (cents && !multiplied) {
+              trade.premium /= 100;
+              changed = true;
+            } else if (!cents && multiplied) {
+              trade.premium *= 100;
+              changed = true;
+            }
+          }
+          if (changed) {
+            delete trade.premiumPrecision;
+            cursor.update(trade);
+          }
+          cursor.continue();
+        };
+
+        // Enriched trades contain derived efficiencies and must be rebuilt from migrated trades.
+        const calculations = transaction.objectStore(STORES.CALCULATIONS);
+        const cacheCursor = calculations.openCursor();
+        cacheCursor.onsuccess = () => {
+          const cursor = cacheCursor.result;
+          if (!cursor) return;
+          if (cursor.value.calculationType === "enriched_trades") cursor.delete();
+          cursor.continue();
+        };
       }
 
       transaction.oncomplete = () => {
