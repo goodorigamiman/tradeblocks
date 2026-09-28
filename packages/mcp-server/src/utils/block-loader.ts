@@ -76,11 +76,12 @@ export interface LoadedBlock {
 }
 
 /**
- * Parse a YYYY-MM-DD date string preserving the calendar date.
+ * Parse a date string preserving its YYYY-MM-DD calendar date, including when a time or
+ * timezone suffix follows it (`2024-01-02T00:00:00Z` is January 2 on every server).
  * Same approach as lib/processing for consistency.
  */
 function parseDatePreservingCalendarDay(dateStr: string): Date {
-  const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})(?=$|[T ])/);
   if (match) {
     const [, year, month, day] = match;
     return new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
@@ -99,6 +100,54 @@ function parseNumber(value: string | undefined, defaultValue?: number): number {
   const cleaned = value.replace(/[$,%]/g, "").trim();
   const parsed = parseFloat(cleaned);
   return isNaN(parsed) ? (defaultValue ?? 0) : parsed;
+}
+
+const DAILY_VALUE_COLUMNS = [
+  "Net Liquidity",
+  "Portfolio Value",
+  "Value",
+  "Equity",
+  "NetLiquidity",
+] as const;
+
+function dailyValueColumn(raw: Record<string, string>): string | undefined {
+  return DAILY_VALUE_COLUMNS.find((column) => Object.hasOwn(raw, column));
+}
+
+function isParsedNumber(value: string | undefined): boolean {
+  const cleaned = value?.replace(/[$,%]/g, "").trim();
+  return (
+    !!cleaned &&
+    /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(cleaned) &&
+    Number.isFinite(Number(cleaned))
+  );
+}
+
+/**
+ * A CSV date is valid when its calendar prefix names a real day and the whole value parses.
+ * The calendar check uses UTC arithmetic on the parts, and the full-value check only tests
+ * parseability, so acceptance never depends on the server's timezone.
+ */
+function isValidCsvDate(value: string | undefined, tat = false): boolean {
+  if (!value) return false;
+  const iso = value.match(/^(\d{4})-(\d{2})-(\d{2})(?=$|[T ])/);
+  const us = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?=$|[ T])/);
+  if (iso || us) {
+    const year = Number(iso ? iso[1] : us![3]);
+    const month = Number(iso ? iso[2] : us![1]);
+    const day = Number(iso ? iso[3] : us![2]);
+    const date = new Date(0);
+    date.setUTCFullYear(year, month - 1, day);
+    if (
+      date.getUTCFullYear() !== year ||
+      date.getUTCMonth() + 1 !== month ||
+      date.getUTCDate() !== day
+    ) {
+      return false;
+    }
+    if (tat) return true;
+  }
+  return !tat && !Number.isNaN(parseDatePreservingCalendarDay(value).getTime());
 }
 
 const KNOWN_TRADE_COLUMNS = new Set([
@@ -282,10 +331,12 @@ function convertToDailyLogEntry(
   try {
     const date = parseDatePreservingCalendarDay(raw["Date"]);
     if (isNaN(date.getTime())) return null;
+    const valueColumn = dailyValueColumn(raw);
+    if (!valueColumn || !isParsedNumber(raw[valueColumn])) return null;
 
     return {
       date,
-      netLiquidity: parseNumber(raw["Net Liquidity"]),
+      netLiquidity: parseNumber(raw[valueColumn]),
       currentFunds: parseNumber(raw["Current Funds"]),
       withdrawn: parseNumber(raw["Withdrawn"], 0),
       tradingFunds: parseNumber(raw["Trading Funds"]),
@@ -872,8 +923,7 @@ function validateCsvColumns(
         }
         const incompleteRow = records.findIndex(
           (record) =>
-            !Number.isFinite(parseNumber(record[openingFeeColumn], NaN)) ||
-            !Number.isFinite(parseNumber(record[closingFeeColumn], NaN)),
+            !isParsedNumber(record[openingFeeColumn]) || !isParsedNumber(record[closingFeeColumn]),
         );
         if (incompleteRow >= 0) {
           return {
@@ -885,37 +935,78 @@ function validateCsvColumns(
       break;
     }
     case "dailylog": {
-      // Required columns for daily log
-      const required = ["Date", "Net Liquidity"];
-      const missing = required.filter((col) => !headers.includes(col));
-      if (missing.length > 0) {
+      if (!headers.includes("Date") || !dailyValueColumn(records[0])) {
         return {
           valid: false,
-          error: `Missing required columns for dailylog: ${missing.join(", ")}. Expected columns include: Date, Net Liquidity, P/L, etc.`,
+          error:
+            "Missing required columns for dailylog: Date, Net Liquidity (or Portfolio Value, Value, Equity). Expected columns include: Date, Net Liquidity, P/L, etc.",
         };
       }
       break;
     }
     case "reportinglog": {
       // Check for TAT format first (has TradeID, ProfitLoss, BuyingPower)
-      if (isTatFormat(headers)) {
-        break; // TAT format is valid, skip OO column checks
-      }
-      // Required columns for OO reporting log (with aliases)
-      const dateOpenedAliases = ["Date Opened", "date_opened"];
-      const plAliases = ["P/L", "pl"];
-      const hasDateOpened = dateOpenedAliases.some((col) => headers.includes(col));
-      const hasPl = plAliases.some((col) => headers.includes(col));
-      const missing: string[] = [];
-      if (!hasDateOpened) missing.push("Date Opened");
-      if (!hasPl) missing.push("P/L");
+      if (isTatFormat(headers)) break;
+      // Required columns for OO reporting log, after the REPORTING_TRADE_COLUMN_ALIASES
+      // normalization that convertToReportingTrade applies (e.g. PL → P/L).
+      const normalizedHeaders = Object.keys(normalizeRecordHeaders(records[0]));
+      const missing = ["Date Opened", "P/L"].filter((col) => !normalizedHeaders.includes(col));
       if (missing.length > 0) {
         return {
           valid: false,
-          error: `Missing required columns for reportinglog: ${missing.join(", ")}. Expected columns include: Date Opened (or date_opened), P/L (or pl), Strategy, etc.`,
+          error: `Missing required columns for reportinglog: ${missing.join(", ")}. Expected columns include: Date Opened, P/L (or PL), Strategy, etc.`,
         };
       }
       break;
+    }
+  }
+
+  const tat = csvType === "reportinglog" && isTatFormat(headers);
+  const openDate = tat ? headers.find((key) => key.toLowerCase() === "opendate") : undefined;
+  const fallbackDate = tat ? headers.find((key) => key.toLowerCase() === "date") : undefined;
+  const closed = tat
+    ? (headers.find((key) => key.toLowerCase() === "closedate") ?? "CloseDate")
+    : "Date Closed";
+  const plColumn = tat
+    ? (headers.find((key) => key.toLowerCase() === "profitloss") ?? "ProfitLoss")
+    : "P/L";
+
+  for (const [index, raw] of records.entries()) {
+    const row = index + 2; // Header is file line 1.
+    const record = csvType === "reportinglog" && !tat ? normalizeRecordHeaders(raw) : raw;
+    if (csvType === "dailylog") {
+      if (!isValidCsvDate(record["Date"])) {
+        return { valid: false, error: `CSV row ${row}: invalid Date "${record["Date"]}"` };
+      }
+      const column = dailyValueColumn(record)!;
+      if (!isParsedNumber(record[column])) {
+        return { valid: false, error: `CSV row ${row}: invalid ${column} "${record[column]}"` };
+      }
+      continue;
+    }
+
+    // TAT conversion reads OpenDate whenever it starts with a date, else Date (parseTatDate).
+    const opened = tat
+      ? openDate && /^(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/.test(record[openDate] ?? "")
+        ? openDate
+        : (fallbackDate ?? openDate ?? "OpenDate")
+      : "Date Opened";
+    for (const column of [opened, closed]) {
+      if ((column === opened || record[column]) && !isValidCsvDate(record[column], tat)) {
+        return {
+          valid: false,
+          error: `CSV row ${row}: invalid ${column} "${record[column] ?? ""}"`,
+        };
+      }
+    }
+    if (!isParsedNumber(record[plColumn])) {
+      return {
+        valid: false,
+        error: `CSV row ${row}: invalid ${plColumn} "${record[plColumn] ?? ""}"`,
+      };
+    }
+    if (csvType === "reportinglog" && !convertToReportingTrade(raw)) {
+      return { valid: false, error: `CSV row ${row}: could not load reporting trade` };
     }
   }
 
@@ -1025,6 +1116,54 @@ export async function importCsv(
     throw new Error("Could not derive a valid block ID from the filename or provided name");
   }
 
+  // Extract metadata for return value based on CSV type
+  let dateRange: { start: string | null; end: string | null } = {
+    start: null,
+    end: null,
+  };
+  let strategies: string[] = [];
+  let recordCount = 0;
+
+  if (csvType === "tradelog") {
+    // Parse trades to extract metadata
+    const trades: Trade[] = [];
+    for (const record of records) {
+      const trade = convertToTrade(record, blockId, plBasis);
+      if (trade) trades.push(trade);
+    }
+
+    recordCount = trades.length;
+    if (trades.length > 0) {
+      dateRange = calendarDateRange(trades.map((t) => t.dateOpened));
+      strategies = Array.from(new Set(trades.map((t) => t.strategy))).sort();
+    }
+  } else if (csvType === "dailylog") {
+    // Parse daily logs to extract date range
+    const entries: DailyLogEntry[] = [];
+    for (const record of records) {
+      const entry = convertToDailyLogEntry(record, blockId);
+      if (entry) entries.push(entry);
+    }
+
+    recordCount = entries.length;
+    if (entries.length > 0) {
+      dateRange = calendarDateRange(entries.map((e) => e.date));
+    }
+  } else if (csvType === "reportinglog") {
+    // Parse reporting trades to extract metadata
+    const trades: ReportingTrade[] = [];
+    for (const record of records) {
+      const trade = convertToReportingTrade(record);
+      if (trade) trades.push(trade);
+    }
+
+    recordCount = trades.length;
+    if (trades.length > 0) {
+      dateRange = calendarDateRange(trades.map((t) => t.dateOpened));
+      strategies = Array.from(new Set(trades.map((t) => t.strategy))).sort();
+    }
+  }
+
   // Check if block already exists
   const blockPath = path.join(blocksDir, blockId);
   try {
@@ -1069,55 +1208,11 @@ export async function importCsv(
     throw error;
   }
 
-  // Extract metadata for return value based on CSV type
-  let dateRange: { start: string | null; end: string | null } = {
-    start: null,
-    end: null,
-  };
-  let strategies: string[] = [];
-
-  if (csvType === "tradelog") {
-    // Parse trades to extract metadata
-    const trades: Trade[] = [];
-    for (const record of records) {
-      const trade = convertToTrade(record, blockName, plBasis);
-      if (trade) trades.push(trade);
-    }
-
-    if (trades.length > 0) {
-      dateRange = calendarDateRange(trades.map((t) => t.dateOpened));
-      strategies = Array.from(new Set(trades.map((t) => t.strategy))).sort();
-    }
-  } else if (csvType === "dailylog") {
-    // Parse daily logs to extract date range
-    const entries: DailyLogEntry[] = [];
-    for (const record of records) {
-      const entry = convertToDailyLogEntry(record, blockId);
-      if (entry) entries.push(entry);
-    }
-
-    if (entries.length > 0) {
-      dateRange = calendarDateRange(entries.map((e) => e.date));
-    }
-  } else if (csvType === "reportinglog") {
-    // Parse reporting trades to extract metadata
-    const trades: ReportingTrade[] = [];
-    for (const record of records) {
-      const trade = convertToReportingTrade(record);
-      if (trade) trades.push(trade);
-    }
-
-    if (trades.length > 0) {
-      dateRange = calendarDateRange(trades.map((t) => t.dateOpened));
-      strategies = Array.from(new Set(trades.map((t) => t.strategy))).sort();
-    }
-  }
-
   return {
     blockId,
     name,
     csvType,
-    recordCount: records.length,
+    recordCount,
     dateRange,
     strategies,
     blockPath,
