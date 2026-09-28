@@ -7,6 +7,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { loadBlock, listBlocks, loadReportingLog } from "../../utils/block-loader.ts";
+import { resolveStartingCapital } from "../../utils/starting-capital.ts";
 import {
   createToolOutput,
   formatCurrency,
@@ -28,16 +29,35 @@ import {
 } from "../shared/filters.ts";
 import { withSyncedBlock, withFullSync } from "../middleware/sync-middleware.ts";
 
+function rebuildMissingFundsEquity(trades: Trade[], initialCapital: number): Trade[] {
+  const rebuilt = rebuildEquityCurve(trades, { initialCapital, useNetPl: true });
+  if (rebuilt.every((trade) => trade.dateClosed)) return rebuilt;
+  // The shared rebuild leaves open rows untouched; their placeholder 0 must not
+  // become a fictitious pre-trade balance when statistics include an open row.
+  return rebuilt.map((trade) =>
+    trade.dateClosed ? trade : { ...trade, fundsAtClose: initialCapital + getNetPl(trade) },
+  );
+}
+
 export function rebuildSubsetEquity(
   trades: Trade[],
   allTrades: Trade[],
   dailyLogs?: DailyLogEntry[],
 ): Trade[] {
-  const initialCapital = PortfolioStatsCalculator.calculateInitialCapital(allTrades, dailyLogs);
-  return rebuildEquityCurve(trades, {
-    initialCapital,
-    useNetPl: true,
-  });
+  const tradeCapital = resolveStartingCapital(allTrades);
+  const dailyCapital =
+    tradeCapital.source === "observed_trade_funds" && dailyLogs?.length
+      ? PortfolioStatsCalculator.calculateInitialCapital(allTrades, dailyLogs)
+      : undefined;
+  const initialCapital =
+    tradeCapital.source === "assumed_default"
+      ? tradeCapital.amount
+      : dailyCapital !== undefined && Number.isFinite(dailyCapital) && dailyCapital > 0
+        ? dailyCapital
+        : tradeCapital.amount;
+  return tradeCapital.source === "assumed_default"
+    ? rebuildMissingFundsEquity(trades, initialCapital)
+    : rebuildEquityCurve(trades, { initialCapital, useNetPl: true });
 }
 
 /**
@@ -464,16 +484,37 @@ export function registerCoreBlockTools(server: McpServer, baseDir: string): void
           // When a subset filter is applied, daily logs cannot be used because they
           // represent the full portfolio rather than the selected strategy/ticker.
           const effectiveDailyLogs = isSubsetFiltered ? undefined : filteredDailyLogs;
+          const baseTrades = isSubsetFiltered ? allTrades : trades;
+          const tradeCapital = resolveStartingCapital(baseTrades);
+          const capitalDailyLogs = isSubsetFiltered ? dailyLogs : effectiveDailyLogs;
+          const dailyCapital =
+            tradeCapital.source === "observed_trade_funds" && capitalDailyLogs?.length
+              ? PortfolioStatsCalculator.calculateInitialCapital(baseTrades, capitalDailyLogs)
+              : undefined;
+          const capital =
+            tradeCapital.source === "observed_trade_funds"
+              ? dailyCapital !== undefined && Number.isFinite(dailyCapital) && dailyCapital > 0
+                ? { amount: dailyCapital, source: "daily_log" as const }
+                : tradeCapital
+              : resolveStartingCapital(baseTrades, effectiveDailyLogs);
+          // The calculator uses fundsAtClose for trade drawdown and CAGR too.
+          // Reconstruct absent balances before calculating, not only the reported start.
+          if (!isSubsetFiltered && tradeCapital.source !== "observed_trade_funds") {
+            trades = rebuildMissingFundsEquity(trades, capital.amount);
+          }
+          // Daily observations stay the metric source exactly as before; only the
+          // reported start is replaced when the daily row cannot evidence it.
           const requestCalculator = new PortfolioStatsCalculator({ riskFreeRateAnnualPct });
           const stats = requestCalculator.calculatePortfolioStats(
             trades,
             effectiveDailyLogs,
             isSubsetFiltered,
           );
-          const calculationMethodology = requestCalculator.getCalculationMethodology(
-            trades,
-            effectiveDailyLogs,
-          );
+          stats.initialCapital = capital.amount;
+          const calculationMethodology = {
+            ...requestCalculator.getCalculationMethodology(trades, effectiveDailyLogs),
+            initialCapital: { source: capital.source },
+          };
 
           // Calculate peak daily exposure
           const peakExposure = calculatePeakExposure(trades, stats.initialCapital);
