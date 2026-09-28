@@ -1,9 +1,10 @@
 import {
-  calculateOoReplayAttribution,
+  calculateOoReplayAttribution as replay,
   cumulativeReplayTradeMark,
   occReplayTickers,
   valueReplayLegs,
   type ReplayTrade,
+  type ReplayStrategyCost,
 } from "@tradeblocks/lib";
 import { describe, expect, it } from "@jest/globals";
 
@@ -23,11 +24,75 @@ const trade: ReplayTrade = {
   strategyId: "a",
   strategyName: "A",
   legs: [short(5000)],
+  numberOfContracts: 1,
   openingFees: 1,
   profit: 36,
 };
 
+const cost: ReplayStrategyCost = {
+  opening_fee_per_leg_contract: 1,
+  exit_slippage: 0,
+  exit_slippage_source: "exitSlippage",
+  settings_sha256: "a".repeat(64),
+  settings_run_id: `run_${"b".repeat(64)}`,
+  backtest_id: `bt_${"c".repeat(64)}`,
+};
+const calculateOoReplayAttribution: typeof replay = (input) =>
+  replay({
+    ...input,
+    parameters: {
+      cost_schedule: { a: cost, b: cost, c: cost, rut: cost },
+      ...input.parameters,
+    },
+  });
+
 describe("OO replay attribution public interface", () => {
+  it("uses the equity close minus one minute on an early session by default", () => {
+    const curve = [
+      { date: "2025-07-02", netLiquidity: 1000 },
+      { date: "2025-07-03", netLiquidity: 1020 },
+      { date: "2025-07-07", netLiquidity: 1038 },
+      { date: "2025-07-08", netLiquidity: 1040 },
+    ];
+    const times: string[] = [];
+    const quoteLookup = (date: string, ticker: string, markTime: string) => {
+      if (ticker.startsWith("SPXW")) times.push(`${date} ${markTime}`);
+      return ticker.startsWith("SPXW")
+        ? { bid: date === "2025-07-02" ? 1 : 0.8, ask: date === "2025-07-02" ? 1 : 0.8 }
+        : undefined;
+    };
+    const position = { ...trade, dateOpened: "2025-07-02", dateClosed: "2025-07-08" };
+    const v2 = calculateOoReplayAttribution({
+      trades: [position],
+      curve,
+      quoteLookup,
+    });
+    expect(v2.method_id).toBe("oo-replay-method/v2");
+    expect(v2.method_parameters).toMatchObject({
+      mark_rule: "equity_close_minus_1m",
+      calendar_revision: "xnys-full-day-2022-2030-v1",
+    });
+    expect(times).toEqual(["2025-07-02 15:59", "2025-07-03 12:59", "2025-07-07 15:59"]);
+  });
+  it("withholds a date outside the calendar revision instead of guessing 15:59", () => {
+    const result = calculateOoReplayAttribution({
+      trades: [{ ...trade, dateOpened: "2030-12-30", dateClosed: "2031-01-03" }],
+      curve: [
+        { date: "2030-12-30", netLiquidity: 1000 },
+        { date: "2031-01-02", netLiquidity: 1020 },
+      ],
+      quoteLookup: () => {
+        throw new Error("No quote may be requested outside the calendar");
+      },
+    });
+    expect(result.stats.daily[0]).toMatchObject({
+      date: "2031-01-02",
+      status: "unavailable",
+      contributions: null,
+      reason: { code: "calendar_unsupported" },
+    });
+    expect(result.quotes.observations).toEqual([]);
+  });
   it("attributes marked open positions and realized closes against the supplied OO book", () => {
     const mids: Record<string, number> = { "2026-06-08": 1, "2026-06-09": 0.8 };
     const result = calculateOoReplayAttribution({
@@ -35,7 +100,7 @@ describe("OO replay attribution public interface", () => {
       curve: [
         { date: "2026-06-08", netLiquidity: 1000 },
         { date: "2026-06-09", netLiquidity: 1020 },
-        { date: "2026-06-10", netLiquidity: 1038 },
+        { date: "2026-06-10", netLiquidity: 1037 },
       ],
       quoteLookup: (date) =>
         mids[date] === undefined ? undefined : { bid: mids[date], ask: mids[date] },
@@ -50,12 +115,74 @@ describe("OO replay attribution public interface", () => {
       },
       {
         date: "2026-06-10",
-        oo_change: 18,
-        contributions: [{ strategy_id: "a", strategy_name: "A", ignored: false, amount: 18 }],
+        oo_change: 17,
+        contributions: [{ strategy_id: "a", strategy_name: "A", ignored: false, amount: 17 }],
         residual: 0,
         status: "available",
       },
     ]);
+  });
+  it("rounds each raw leg mid half-up before charging one fee and saved exit slippage", () => {
+    const result = calculateOoReplayAttribution({
+      trades: [{ ...trade, dateOpened: "2026-06-09", dateClosed: "2026-06-11" }],
+      curve: [
+        { date: "2026-06-08", netLiquidity: 1000 },
+        { date: "2026-06-09", netLiquidity: 984 },
+      ],
+      quoteLookup: () => ({ bid: 0.9, ask: 0.95 }),
+      parameters: { cost_schedule: { a: { ...cost, exit_slippage: 0.2 } } },
+    });
+    expect(result.stats.daily[0]).toMatchObject({
+      status: "available",
+      residual: 0,
+      contributions: [{ strategy_id: "a", amount: -16 }],
+    });
+    expect(result.quotes.observations[0]).toMatchObject({
+      bid: 0.9,
+      ask: 0.95,
+      mid: expect.closeTo(0.95, 10),
+    });
+    expect(result.method_parameters.mid_rounding).toBe("half_up_0.05");
+    expect(result.method_parameters.cost_schedule.a.exit_slippage).toBe(0.2);
+  });
+
+  it("uses the bound fee per leg-contract rather than an inconsistent row fee", () => {
+    const result = calculateOoReplayAttribution({
+      trades: [{ ...trade, dateOpened: "2026-06-09", dateClosed: "2026-06-11" }],
+      curve: [
+        { date: "2026-06-08", netLiquidity: 1000 },
+        { date: "2026-06-09", netLiquidity: 983 },
+      ],
+      quoteLookup: () => ({ bid: 0.9, ask: 0.95 }),
+      parameters: {
+        cost_schedule: { a: { ...cost, opening_fee_per_leg_contract: 2, exit_slippage: 0.2 } },
+      },
+    });
+    expect(result.stats.daily[0]).toMatchObject({
+      status: "available",
+      residual: 0,
+      contributions: [{ strategy_id: "a", amount: -17 }],
+    });
+  });
+
+  it("withholds the named strategy rather than assigning missing costs a zero charge", () => {
+    const result = replay({
+      trades: [{ ...trade, dateOpened: "2026-06-09", dateClosed: "2026-06-11" }],
+      curve: [
+        { date: "2026-06-08", netLiquidity: 1000 },
+        { date: "2026-06-09", netLiquidity: 984 },
+      ],
+      quoteLookup: () => {
+        throw new Error("Unavailable cost must not request a quote");
+      },
+    });
+    expect(result.stats.daily[0]).toMatchObject({
+      status: "unavailable",
+      contributions: null,
+      residual: null,
+      reason: { code: "missing_strategy_cost", strategies: ["A"] },
+    });
+    expect(result.quotes.observations).toEqual([]);
   });
   it("replays two leg groups and an ignored position, while withholding unsupported days", () => {
     const cd: ReplayTrade = {
@@ -82,8 +209,8 @@ describe("OO replay attribution public interface", () => {
       ...trade,
       strategyId: "c",
       strategyName: "C",
-      dateOpened: "2026-06-13",
-      dateClosed: "2026-06-13",
+      dateOpened: "2026-06-15",
+      dateClosed: "2026-06-15",
       profit: 10,
     };
     const quoteLookup = (date: string, ticker: string) => {
@@ -102,10 +229,10 @@ describe("OO replay attribution public interface", () => {
       curve: [
         { date: "2026-06-08", netLiquidity: 1000 },
         { date: "2026-06-09", netLiquidity: 1070 },
-        { date: "2026-06-10", netLiquidity: 982 },
-        { date: "2026-06-11", netLiquidity: 982 },
-        { date: "2026-06-12", netLiquidity: 982 },
-        { date: "2026-06-13", netLiquidity: 1002 },
+        { date: "2026-06-10", netLiquidity: 981 },
+        { date: "2026-06-11", netLiquidity: 981 },
+        { date: "2026-06-12", netLiquidity: 981 },
+        { date: "2026-06-15", netLiquidity: 1001 },
       ],
       quoteLookup,
     });
@@ -116,7 +243,7 @@ describe("OO replay attribution public interface", () => {
     ]);
     expect(close.contributions).toEqual([
       { strategy_id: "a", strategy_name: "A", ignored: false, amount: -40 },
-      { strategy_id: "b:ignored", strategy_name: "B", ignored: true, amount: -48 },
+      { strategy_id: "b:ignored", strategy_name: "B", ignored: true, amount: -49 },
     ]);
     expect(close.contributions!.reduce((sum, row) => sum + row.amount, 0) + close.residual!).toBe(
       close.oo_change,
@@ -144,22 +271,101 @@ describe("OO replay attribution public interface", () => {
       unavailable_reasons: { missing_quote: 1, missing_prior_mark: 1, over_tolerance: 1 },
     });
     expect(result.stats.by_strategy.find((row) => row.ignored)).toMatchObject({
-      total: 2,
-      drawdown: { amount: 48, peak_date: "2026-06-09", trough_date: "2026-06-10" },
+      total: 1,
+      drawdown: { amount: 49, peak_date: "2026-06-09", trough_date: "2026-06-10" },
     });
     expect(result.stats.episodes[0]).toMatchObject({
       peak_date: "2026-06-09",
       trough_date: "2026-06-10",
-      oo_drawdown: 88,
-      contributions: { a: -40, "b:ignored": -48 },
+      oo_drawdown: 89,
+      contributions: { a: -40, "b:ignored": -49 },
     });
-    expect(result.quotes.observations).toContainEqual({
-      date: "2026-06-11",
-      ticker: "SPXW260612P05200000",
-      missing: true,
-    });
+    expect(result.quotes.observations).toContainEqual(
+      expect.objectContaining({
+        date: "2026-06-11",
+        ticker: "SPXW260612P05200000",
+        missing: true,
+        mark_time: "15:59",
+      }),
+    );
   });
 
+  it("withholds a direct trade mark when its per-strategy cost is absent", () => {
+    let quoteCalls = 0;
+    // @ts-expect-error Untyped callers can still omit the required strategy cost.
+    const mark = cumulativeReplayTradeMark(trade, "2026-06-09", () => {
+      quoteCalls++;
+      return { bid: 1, ask: 1 };
+    });
+    expect(mark).toEqual({
+      value: null,
+      reason: "missing_strategy_cost",
+      missing_tickers: [],
+      observations: [],
+    });
+    expect(quoteCalls).toBe(0);
+    const inferredCount = cumulativeReplayTradeMark(
+      { ...trade, numberOfContracts: undefined },
+      "2026-06-09",
+      () => ({ bid: 1, ask: 1 }),
+      cost,
+    );
+    expect(inferredCount.value).toBe(-1);
+  });
+  it("uses a shared package count for uniform legs and explicit mixed-ratio spreads", () => {
+    const uniform = {
+      ...trade,
+      dateOpened: "2026-06-09",
+      dateClosed: "2026-06-11",
+      numberOfContracts: undefined,
+      legs: [
+        { ...short(5000), numberOfContracts: 2 },
+        { ...short(5100), buySell: "Buy" as const, numberOfContracts: 2, pricePerContract: 50 },
+      ],
+    };
+    const slippageCost = { ...cost, exit_slippage: 0.2 };
+    const result = calculateOoReplayAttribution({
+      trades: [uniform],
+      curve: [
+        { date: "2026-06-08", netLiquidity: 1000 },
+        { date: "2026-06-09", netLiquidity: 1056 },
+      ],
+      quoteLookup: () => ({ bid: 1, ask: 1 }),
+      parameters: { cost_schedule: { a: slippageCost } },
+    });
+    expect(result.stats.daily[0]).toMatchObject({
+      status: "available",
+      contributions: [{ strategy_id: "a", amount: 56 }],
+      residual: 0,
+    });
+    const mixed = {
+      ...uniform,
+      legs: [uniform.legs[0], { ...uniform.legs[1], numberOfContracts: 1 }],
+    };
+    const explicit = cumulativeReplayTradeMark(
+      { ...mixed, numberOfContracts: 2 },
+      "2026-06-09",
+      () => ({ bid: 1, ask: 1 }),
+      slippageCost,
+    );
+    expect(explicit.value).toBe(7);
+    const withoutAggregate = calculateOoReplayAttribution({
+      trades: [mixed],
+      curve: [
+        { date: "2026-06-08", netLiquidity: 1000 },
+        { date: "2026-06-09", netLiquidity: 1000 },
+      ],
+      quoteLookup: () => {
+        throw new Error("Mixed package counts must not request quotes");
+      },
+      parameters: { cost_schedule: { a: slippageCost } },
+    });
+    expect(withoutAggregate.stats.daily[0]).toMatchObject({
+      status: "unavailable",
+      reason: { code: "missing_strategy_cost", strategies: ["A"] },
+    });
+    expect(withoutAggregate.quotes.observations).toEqual([]);
+  });
   it("prefers an observed SPXW mark on third Friday and records attempted monthly fallback", () => {
     const monthly = { ...short(5000), expiration: "20260619" };
     expect(occReplayTickers(monthly, "SPX")).toEqual(["SPXW260619P05000000", "SPX260619P05000000"]);
@@ -177,8 +383,9 @@ describe("OO replay attribution public interface", () => {
       { ...trade, legs: [monthly] },
       "2026-06-18",
       (_, ticker) => (ticker.startsWith("SPXW") ? undefined : { bid: 0.5, ask: 0.5 }),
+      cost,
     );
-    expect(fallback.value).toBe(48);
+    expect(fallback.value).toBe(49);
     expect(fallback.observations).toContainEqual({
       date: "2026-06-18",
       ticker: "SPXW260619P05000000",
@@ -256,12 +463,15 @@ describe("OO replay attribution public interface", () => {
         residual: null,
         reason: { code: "missing_quote", tickers: expect.arrayContaining(["SPXW260612P05000000"]) },
       });
-      expect(result.quotes.observations).toContainEqual({
-        date: "2026-06-09",
-        ticker: "SPXW260612P05000000",
-        missing: true,
-        reason,
-      });
+      expect(result.quotes.observations).toContainEqual(
+        expect.objectContaining({
+          date: "2026-06-09",
+          ticker: "SPXW260612P05000000",
+          missing: true,
+          mark_time: "15:59",
+          reason,
+        }),
+      );
       expect(result.method_parameters.quote_validity).toBe("positive-uncrossed-max10x-v1");
     },
   );
