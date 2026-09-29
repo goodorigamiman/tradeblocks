@@ -13,5 +13,11 @@ export interface TradeBlocksPluginContext {
 
 export interface TradeBlocksPlugin {
   name: string;
+  /**
+   * Register tools with `server.registerTool` and a Zod object `inputSchema`. The server
+   * makes that object strict, so a call with an undeclared argument is refused. A tool
+   * registered with any other input schema, or through the legacy `server.tool()`, is
+   * refused at registration.
+   */
   registerTools?: (server: McpServer, context: TradeBlocksPluginContext) => void;
 }
