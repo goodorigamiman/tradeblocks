@@ -400,6 +400,29 @@ describe("calculateDailyExposure", () => {
       expect(exposureByDate.get("2024-01-04")?.exposurePercent).toBeCloseTo(9.09, 1);
     });
 
+    it("should divide by the last equity point of a day when several share it", () => {
+      const trades = [
+        createTrade({
+          dateOpened: etDate("2024-01-02"),
+          timeOpened: "09:30:00",
+          dateClosed: etDate("2024-01-03"),
+          timeClosed: "15:00:00",
+          marginReq: 1000,
+        }),
+      ];
+
+      // The web snapshot emits one point per closed trade, so a day can carry several.
+      const equityCurve = [
+        createEquityPoint("2024-01-02", 20000),
+        createEquityPoint("2024-01-02", 10000),
+      ];
+
+      const result = calculateDailyExposure(trades, equityCurve);
+      const day = result.dailyExposure.find((p) => p.date === "2024-01-02");
+
+      expect(day?.exposurePercent).toBeCloseTo(10, 5);
+    });
+
     it("should return 0% when equity is zero or not available", () => {
       const trades = [
         createTrade({
@@ -881,6 +904,26 @@ describe("calculateExposureAtTradeOpen", () => {
       expect(exp2!.exposureAfter).toBe(3000);
     });
 
+    it("should divide by the last equity point of a day when several share it", () => {
+      const trades = [
+        createTrade({
+          dateOpened: etDate("2024-01-15"),
+          timeOpened: "09:30:00",
+          dateClosed: etDate("2024-01-16"),
+          timeClosed: "15:00:00",
+          marginReq: 5000,
+        }),
+      ];
+
+      const equityCurve = [
+        { date: "2024-01-15", equity: 200000 },
+        { date: "2024-01-15", equity: 100000 },
+      ];
+      const result = calculateExposureAtTradeOpen(trades, equityCurve);
+
+      expect(result.get(0)!.exposurePercentAfter).toBe(5); // 5000 / 100000 * 100
+    });
+
     it("should calculate exposure for concurrent trades correctly", () => {
       // Trade 1: 09:30 open, multi-day
       // Trade 2: 10:30 open - should see trade 1's margin
@@ -1032,9 +1075,8 @@ describe("calculateExposureAtTradeOpen", () => {
 });
 
 describe("exposure keyed from the web performance snapshot's equity curve", () => {
-  // The snapshot stamps each equity point as an ISO instant of the local-midnight day (plus
-  // a second offset), unlike the calendar-day strings the MCP tools pass. Both producers'
-  // days must join to the same exposure day in every timezone.
+  // The snapshot dates its opening balance on the day before the first close and each later
+  // point on its close day. Each exposure day must join to that day's equity in every timezone.
   const trades = [
     createTrade({
       dateOpened: etDate("2024-01-02"),
