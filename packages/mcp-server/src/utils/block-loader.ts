@@ -162,6 +162,8 @@ const KNOWN_TRADE_COLUMNS = new Set([
   "Avg. Closing Cost",
   "Reason For Close",
   "P/L",
+  // "P/L %" is deliberately absent: it also stays in customFields, so existing `custom.P/L %`
+  // report queries keep working alongside the typed `plPct`.
   "P/L Basis",
   "No. of Contracts",
   "Funds at Close",
@@ -259,6 +261,9 @@ function convertToTrade(
 
     const legs = raw["Legs"] || raw["Symbol"] || "";
     const fundsAtClose = parseNumber(raw["Funds at Close"], NaN);
+    // P/L % is optional: a blank or unparseable cell is absent, never zero, so the trade keeps
+    // its computed value.
+    const reportedPlPct = parseNumber(raw["P/L %"], NaN);
 
     const trade: Trade = {
       dateOpened,
@@ -276,6 +281,7 @@ function convertToTrade(
         raw["P/L Basis"] === PlBasis.GrossBeforeFees || raw["P/L Basis"] === PlBasis.NetIncludesFees
           ? raw["P/L Basis"]
           : defaultPlBasis,
+      plPct: Number.isFinite(reportedPlPct) ? reportedPlPct : undefined,
       numContracts: Math.round(parseNumber(raw["No. of Contracts"], 1)),
       fundsAtClose: Number.isFinite(fundsAtClose) ? fundsAtClose : 0,
       fundsAtCloseProvided: Number.isFinite(fundsAtClose),

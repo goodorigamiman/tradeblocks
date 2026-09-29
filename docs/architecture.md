@@ -127,6 +127,13 @@ drops the row rather than manufacturing zero.
   rows without a confirmed quote unit cannot contribute a Premium Capture value;
   rows with a matching saved OO source `Initial Premium` cell retain their
   verifiable quote provenance.
+- A trade's P/L % is the source's own `P/L %` cell (`Trade.plPct`) when the trade log carries a
+  numeric one; otherwise it is `pl / (|premium| × numContracts) × 100`. Enrichment and the MCP report
+  helpers resolve `plPct` (and its alias `premiumEfficiency`) this way; `netPlPct` is always
+  computed from net P&L, so where the source's cell differs from the recomputation the two differ
+  for reasons other than fees. Combined leg groups carry the source value for a single-row group
+  only; a multi-row group computes it from the combined P/L and premium. The MCP server also keeps
+  the raw column as `custom.P/L %`.
 - Strategy filtering uses trades, not daily logs. Daily logs represent the full portfolio and cannot
   be attributed safely to one strategy.
 - Drawdown calculations use daily logs when present and otherwise fall back to a trade-based equity
